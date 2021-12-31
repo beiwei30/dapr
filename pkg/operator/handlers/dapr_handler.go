@@ -51,11 +51,6 @@ type DaprHandler struct {
 	Scheme *runtime.Scheme
 }
 
-type innerReconciler struct {
-	h       *DaprHandler
-	factory func() client.Object
-}
-
 // NewDaprHandler returns a new Dapr handler.
 func NewDaprHandler(mgr ctrl.Manager) *DaprHandler {
 	return &DaprHandler{
@@ -75,7 +70,8 @@ func (h *DaprHandler) Init() error {
 		func(rawObj client.Object) []string {
 			svc := rawObj.(*corev1.Service)
 			owner := meta_v1.GetControllerOf(svc)
-			if owner == nil || owner.APIVersion != appsv1.SchemeGroupVersion.String() || (owner.Kind != "Deployment" && owner.Kind != "StatefulSet") {
+			if owner == nil || owner.APIVersion != appsv1.SchemeGroupVersion.String() ||
+				(owner.Kind != "Deployment" && owner.Kind != "StatefulSet") {
 				return nil
 			}
 			return []string{owner.Name}
@@ -83,57 +79,57 @@ func (h *DaprHandler) Init() error {
 		return err
 	}
 
-	if err := ctrl.NewControllerManagedBy(h.mgr).
+	err := ctrl.NewControllerManagedBy(h.mgr).
 		For(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
-		WithOptions(controller.Options{
-			MaxConcurrentReconciles: 100,
-		}).
-		Complete(&innerReconciler{
-			h: h,
-			factory: func() client.Object {
-				return &appsv1.Deployment{}
-			},
-		}); err != nil {
+		WithOptions(controller.Options{MaxConcurrentReconciles: 100}).
+		Complete(h)
+
+	if err != nil {
 		return err
 	}
+
 	return ctrl.NewControllerManagedBy(h.mgr).
 		For(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
-		WithOptions(controller.Options{
-			MaxConcurrentReconciles: 100,
-		}).
-		Complete(&innerReconciler{
-			h: h,
-			factory: func() client.Object {
-				return &appsv1.StatefulSet{}
-			},
-		})
+		WithOptions(controller.Options{MaxConcurrentReconciles: 100}).
+		Complete(h)
 }
 
 // Reconcile the expected services for deployments | statefulset annotated for Dapr.
-func (i *innerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (h *DaprHandler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	// var obj appsv1.Deployment | appsv1.StatefulSet
-	obj := i.factory()
-
-	expectedService := false
-	if err := i.h.Get(ctx, req.NamespacedName, obj); err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Debugf("deployment has be deleted, %s", req.NamespacedName)
+	result, err := h.reconcile(ctx, req, &appsv1.Deployment{})
+	if err != nil {
+		if result.Requeue {
+			return result, err
 		} else {
-			log.Errorf("unable to get deployment, %s, err: %s", req.NamespacedName, err)
+			result, err = h.reconcile(ctx, req, &appsv1.StatefulSet{})
+		}
+	}
+	return result, err
+}
+
+func (h *DaprHandler) reconcile(ctx context.Context, req ctrl.Request, obj client.Object) (ctrl.Result, error) {
+	expectedService := false
+	kind := obj.GetObjectKind().GroupVersionKind().Kind
+	if err := h.Get(ctx, req.NamespacedName, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Debugf("%s has be deleted, %s", kind, req.NamespacedName)
+		} else {
+			log.Errorf("unable to get %s, %s, err: %s", kind, req.NamespacedName, err)
 			return ctrl.Result{}, err
 		}
 	} else {
 		if obj.GetDeletionTimestamp() != nil {
-			log.Debugf("deployment is being deleted, %s", req.NamespacedName)
+			log.Debugf("%s is being deleted, %s", kind, req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
-		expectedService = i.h.isAnnotatedForDapr(obj)
+		expectedService = h.isAnnotatedForDapr(obj)
 	}
 
 	if expectedService {
-		if err := i.h.ensureDaprServicePresent(ctx, req.Namespace, obj); err != nil {
+		if err := h.ensureDaprServicePresent(ctx, req.Namespace, obj); err != nil {
 			return ctrl.Result{Requeue: true}, err
 		}
 	}
